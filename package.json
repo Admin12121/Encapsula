@@ -1,0 +1,65 @@
+{
+  "name": "encapsula",
+  "version": "1.1.4",
+  "description": "Terminal-based steganography tool for hiding encrypted messages in files using AES-256 encryption",
+  "main": "dist/index.js",
+  "bin": {
+    "encapsula": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "steganography",
+    "encryption",
+    "cli",
+    "terminal",
+    "tui",
+    "hide-data",
+    "secret-message",
+    "encode",
+    "decode",
+    "security",
+    "aes-256",
+    "file-hiding",
+    "cryptography",
+    "privacy",
+    "password-protection"
+  ],
+  "type": "commonjs",
+  "author": "admin12121",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/admin12121/Encapsula.git"
+  },
+  "bugs": {
+    "url": "https://github.com/admin12121/Encapsula/issues"
+  },
+  "homepage": "https://github.com/admin12121/Encapsula#readme",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "cfonts": "^3.3.1",
+    "chalk": "^5.6.2",
+    "node-file-dialog": "^1.0.0",
+    "open": "^10.2.0",
+    "strip-ansi": "^7.1.0",
+    "terminal-kit": "^3.1.2",
+    "terminal-link": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.8.0",
+    "@types/terminal-kit": "^2.5.7",
+    "nodemon": "^3.0.1",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.2.2"
+  }
+}
