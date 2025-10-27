@@ -7,9 +7,8 @@ export async function startupProgress() {
   term.clear();
 
   const steps = [
-    "Initializing portfolio...",
+    "Initializing...",
     "Loading terminal interface...",
-    "Setting up navigation...",
     "Loading sections...",
     "Ready to launch!",
   ];
@@ -44,7 +43,6 @@ export async function exitProgress() {
 
   const steps = [
     "Closing connections",
-    "Saving state",
     "Clearing cache",
     "Finalizing shutdown",
   ];

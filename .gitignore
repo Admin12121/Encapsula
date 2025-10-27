@@ -36,6 +36,9 @@ build/Release
 node_modules/
 jspm_packages/
 
+# Build output
+dist/
+
 # Optional npm cache directory
 .npm
 
@@ -50,6 +53,12 @@ jspm_packages/
 
 # dotenv environment variables file
 .env
+.env.local
+.env.*.local
+
+# NPM
+.npmrc
+package-lock.json
 
 # VS Code
 .vscode/

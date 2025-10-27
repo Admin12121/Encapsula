@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import * as termkit from "terminal-kit";
 import {
   initTerminal,
