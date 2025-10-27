@@ -32,11 +32,11 @@ interface UploadedFile {
 interface State {
   screen: Screen;
   uploadedFile: UploadedFile | null;
-  message: string; // full multi-line message
-  password: string; // stored temporarily until processing begins
-  inputBuffer: string; // used while typing (message or password)
+  message: string;
+  password: Buffer | null;
+  inputBuffer: string;
   outputPath: string;
-  progress: number; // 0-100
+  progress: number;
   intermediateWritten: boolean;
   downloadedPath?: string;
   error?: string;
@@ -46,14 +46,19 @@ let state: State = {
   screen: "upload",
   uploadedFile: null,
   message: "",
-  password: "",
+  password: null,
   inputBuffer: "",
   outputPath: "",
   progress: 0,
   intermediateWritten: false,
 };
 
-// Helpers
+function secureWipeBuffer(buffer: Buffer | null) {
+  if (buffer) {
+    buffer.fill(0);
+  }
+}
+
 function stripAnsi(s: string) {
   return s.replace(/\x1b\[[0-9;]*m/g, "");
 }
@@ -105,20 +110,20 @@ function makeOutputPath(inPath: string) {
   return path.join(dir, `${name}_encoded${ext}`);
 }
 
-function deriveKey(password: string) {
-  const salt = crypto.createHash("sha256").update("encapsula-salt").digest();
+function deriveKey(password: string, salt: Buffer) {
   return crypto.pbkdf2Sync(password, salt, 100000, 32, "sha512");
 }
 
-function encryptMessage(message: string, password: string) {
-  const key = deriveKey(password);
+function encryptMessage(message: string, password: Buffer) {
+  const salt = crypto.randomBytes(32);
+  const key = deriveKey(password.toString("utf8"), salt);
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
   const encrypted = Buffer.concat([
     cipher.update(message, "utf8"),
     cipher.final(),
   ]);
-  return { iv, encrypted };
+  return { salt, iv, encrypted };
 }
 
 function embedGeneric(fileBuffer: Buffer, data: Buffer) {
@@ -132,7 +137,6 @@ function sleep(ms: number) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-// Processing
 async function processEncoding() {
   if (!state.uploadedFile) {
     state.error = "No file selected";
@@ -148,14 +152,12 @@ async function processEncoding() {
   try {
     const fileBuffer = fs.readFileSync(state.uploadedFile.path);
 
-    // encrypt (user provided password)
-    const { iv, encrypted } = encryptMessage(
+    const { salt, iv, encrypted } = encryptMessage(
       state.message,
-      state.password || "",
+      state.password || Buffer.alloc(0),
     );
-    const payload = Buffer.concat([iv, encrypted]);
+    const payload = Buffer.concat([salt, iv, encrypted]);
 
-    // simulate three-phase progress: 0-33 upload, 34-66 encrypt, 67-99 finalize; write intermediate at 66
     for (let p = 0; p <= 100; p++) {
       state.progress = p;
 
@@ -169,8 +171,6 @@ async function processEncoding() {
             "Failed to write intermediate file: " + (e as Error).message;
         }
       }
-
-      // small visible delay
       await sleep(40);
 
       if ((global as any).showSection) {
@@ -180,11 +180,9 @@ async function processEncoding() {
       }
     }
 
-    // final write
     const final = embedGeneric(fileBuffer, payload);
     fs.writeFileSync(state.outputPath, final);
 
-    // attempt to copy final encoded file to Downloads automatically and record the path
     try {
       const dest = downloadToDownloads();
       if (!dest) {
@@ -197,15 +195,14 @@ async function processEncoding() {
 
     state.progress = 100;
     state.screen = "complete";
-    // clear sensitive data
-    state.password = "";
+    secureWipeBuffer(state.password);
+    state.password = null;
   } catch (e) {
     state.error = "Processing failed: " + (e as Error).message;
     state.screen = "complete";
   }
 }
 
-// Download helper
 function downloadToDownloads() {
   if (!state.outputPath || !fs.existsSync(state.outputPath)) return null;
   try {
@@ -221,7 +218,6 @@ function downloadToDownloads() {
   }
 }
 
-// Render: produce raw lines (host will center block)
 function renderUpload() {
   const lines: string[] = [];
   lines.push("");
@@ -282,7 +278,6 @@ function renderPassword() {
   return lines.join("\n");
 }
 
-// Progress block: three vertical lines + Press D below
 function renderProgressBlock() {
   const labels = ["Uploading", "Encrypting", "Finalizing"];
   const barWidth = Math.min(
@@ -332,7 +327,6 @@ function renderProcessing() {
   lines.push("");
   lines.push(renderProgressBlock());
   lines.push("");
-  // progress block already includes download hint; avoid duplicating it here
   lines.push(" ");
   return lines.join("\n");
 }
@@ -343,7 +337,6 @@ function renderComplete() {
   lines.push("");
   lines.push(renderProgressBlock());
   lines.push("");
-  // no duplicate prompt here; progress block already shows download hint
   if (state.downloadedPath) {
     lines.push("");
     lines.push("Downloaded: " + chalk.hex("#FFA500")(state.downloadedPath));
@@ -353,7 +346,6 @@ function renderComplete() {
   return lines.join("\n");
 }
 
-// Input handling
 export function handleEncodeInput(key: string, data?: any): boolean {
   const isEnter =
     key === "ENTER" ||
@@ -361,13 +353,13 @@ export function handleEncodeInput(key: string, data?: any): boolean {
     key === "KP_ENTER" ||
     (data && (data.codepoint === 13 || data.codepoint === 10));
 
-  // ESC: reset
   if (key === "ESCAPE") {
+    secureWipeBuffer(state.password);
     state = {
       screen: "upload",
       uploadedFile: null,
       message: "",
-      password: "",
+      password: null,
       inputBuffer: "",
       outputPath: "",
       progress: 0,
@@ -380,7 +372,6 @@ export function handleEncodeInput(key: string, data?: any): boolean {
     return true;
   }
 
-  // Upload screen: open file picker
   if (state.screen === "upload" && isEnter) {
     openFilePicker().then((filePath) => {
       if (filePath) {
@@ -395,6 +386,8 @@ export function handleEncodeInput(key: string, data?: any): boolean {
           state.screen = "message";
           state.inputBuffer = "";
           state.progress = 0;
+          secureWipeBuffer(state.password);
+          state.password = null;
           if ((global as any).showSection)
             try {
               (global as any).showSection("Encode");
@@ -409,7 +402,6 @@ export function handleEncodeInput(key: string, data?: any): boolean {
     return true;
   }
 
-  // Message screen: multiline editing. Enter inserts newline; Ctrl+S finishes (ASCII 19).
   if (state.screen === "message") {
     const isSave = key === "CTRL_S" || (data && data.codepoint === 19);
     if (isSave) {
@@ -424,7 +416,6 @@ export function handleEncodeInput(key: string, data?: any): boolean {
       return true;
     }
 
-    // Enter -> newline
     if (isEnter) {
       state.inputBuffer = state.inputBuffer + "\n";
       if ((global as any).showSection)
@@ -446,14 +437,13 @@ export function handleEncodeInput(key: string, data?: any): boolean {
     return false;
   }
 
-  // Password screen: masked single-line
   if (state.screen === "password") {
     if (isEnter) {
-      state.password = state.inputBuffer;
+      secureWipeBuffer(state.password);
+      state.password = Buffer.from(state.inputBuffer, "utf8");
       state.inputBuffer = "";
       state.progress = 50;
       state.screen = "processing";
-      // start processing async
       setTimeout(() => {
         processEncoding().then(() => {
           if ((global as any).showSection)
@@ -479,7 +469,6 @@ export function handleEncodeInput(key: string, data?: any): boolean {
     return false;
   }
 
-  // Processing: allow D to download if available
   if (state.screen === "processing") {
     if (
       (key === "d" || key === "D") &&
@@ -495,7 +484,6 @@ export function handleEncodeInput(key: string, data?: any): boolean {
     return true; // ignore other keys while processing
   }
 
-  // Complete: allow D to download or any key to reset
   if (state.screen === "complete") {
     if (key === "d" || key === "D") {
       const dest = downloadToDownloads();
@@ -506,11 +494,12 @@ export function handleEncodeInput(key: string, data?: any): boolean {
       return true;
     }
     if (key && key.length > 0) {
+      secureWipeBuffer(state.password);
       state = {
         screen: "upload",
         uploadedFile: null,
         message: "",
-        password: "",
+        password: null,
         inputBuffer: "",
         outputPath: "",
         progress: 0,
@@ -528,7 +517,6 @@ export function handleEncodeInput(key: string, data?: any): boolean {
   return false;
 }
 
-// Main render function: return raw lines; host centers them in the frame
 export default function Encode(): string {
   switch (state.screen) {
     case "upload":

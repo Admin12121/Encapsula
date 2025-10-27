@@ -365,6 +365,132 @@ Decoding:
 | **Steganographic Concealment** | Hidden within normal files | Reduces detection risk |
 | **Multi-Layer Defense** | Encryption + Steganography | Defense in depth |
 
+### Current Limitations
+
+⚠️ **Known Security Concerns** (Planned for v2.0)
+
+#### 1. **Fixed Salt Vulnerability**
+```typescript
+// Current implementation (src/sections/encode.ts)
+const salt = crypto.createHash("sha256").update("encapsula-salt").digest();
+```
+
+**Issue**: Hardcoded salt is the same for all users  
+**Risk**: Enables rainbow table attacks if password is weak  
+**Severity**: Medium  
+**Planned Fix**: Generate random salt per file, store alongside IV
+
+#### 2. **No Data Integrity Verification**
+```typescript
+// Missing HMAC verification
+const payload = Buffer.concat([iv, encrypted]);
+```
+
+**Issue**: No cryptographic signature to verify data integrity  
+**Risk**: Tampering undetectable until decryption fails  
+**Severity**: Medium  
+**Planned Fix**: Add HMAC-SHA256 authentication tag
+
+#### 3. **Marker Collision Risk**
+```typescript
+const marker = Buffer.from("<<ENCAPSULA_HIDDEN>>", "utf8");
+```
+
+**Issue**: If original file contains this exact sequence, extraction could fail  
+**Risk**: Low (20-byte sequence unlikely in practice)  
+**Severity**: Low  
+**Planned Fix**: Use cryptographic markers or offset-based indexing
+
+#### 4. **Limited Size Validation**
+```typescript
+if (dataLength <= 0 || dataLength > 10 * 1024 * 1024) return null;
+```
+
+**Issue**: Arbitrary 10MB limit may be too permissive  
+**Risk**: Potential DoS via memory exhaustion  
+**Severity**: Low  
+**Planned Fix**: Configurable limits with streaming decryption
+
+#### 5. **Password in Memory**
+```typescript
+state.password = state.inputBuffer; // Held until processing
+```
+
+**Issue**: Password string not securely wiped from memory  
+**Risk**: Memory dump could reveal password  
+**Severity**: Low (requires privileged access)  
+**Planned Fix**: Use secure buffers with zeroing
+
+#### 6. **No Forward Secrecy**
+**Issue**: Same password always produces same key (due to fixed salt)  
+**Risk**: Compromised password affects all past/future messages  
+**Severity**: Medium  
+**Planned Fix**: Random per-file salts + optional key rotation
+
+#### 7. **CBC Mode Padding Oracle**
+**Issue**: AES-CBC vulnerable to padding oracle attacks if errors leak info  
+**Risk**: Theoretical (requires timing side-channel)  
+**Severity**: Low  
+**Planned Fix**: Migrate to AES-GCM (authenticated encryption)
+
+---
+
+## 📸 Demo
+
+![Encapsula Demo](./assets/demo.png)
+
+*Interactive terminal interface showing the encode/decode workflow*
+
+---
+
+## 🚀 Future Roadmap
+
+### v2.0 - Security Hardening (Q2 2025)
+
+- [ ] **Random Per-File Salts** — Eliminate rainbow table attacks
+- [ ] **HMAC Authentication** — Add SHA-256 HMAC for integrity verification
+- [ ] **AES-GCM Migration** — Replace CBC with authenticated encryption
+- [ ] **Secure Memory Handling** — Zero-fill password buffers
+- [ ] **Configurable KDF Iterations** — Allow users to adjust PBKDF2 rounds
+
+### v3.0 - Advanced Features (Q3 2025)
+
+- [ ] **Multiple Encryption Modes**
+  - AES-256-GCM (Authenticated)
+  - ChaCha20-Poly1305 (Modern alternative)
+  - RSA + AES Hybrid (Public key encryption)
+
+- [ ] **Encoding Methods**
+  - LSB Steganography (bit-level embedding in images)
+  - Whitespace Encoding (for text files)
+  - File Format-Specific Embedding (JPEG comments, PNG metadata)
+
+- [ ] **Advanced Security**
+  - Multi-factor decryption (password + keyfile)
+  - Plausible deniability (fake passwords reveal decoy messages)
+  - Compression before encryption
+  - Self-destructing messages (time-based deletion)
+
+- [ ] **Enhanced Usability**
+  - GUI version (Electron wrapper)
+  - Batch encoding/decoding
+  - Cloud storage integration
+  - Mobile companion app
+
+### v4.0 - Enterprise Features (Q4 2025)
+
+- [ ] **Audit & Compliance**
+  - Activity logging (with privacy controls)
+  - Access control policies
+  - Compliance reports (GDPR, HIPAA)
+
+- [ ] **Advanced Cryptography**
+  - Quantum-resistant algorithms (CRYSTALS-Kyber)
+  - Threshold cryptography (split keys)
+  - Zero-knowledge proofs
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! Here's how you can help:

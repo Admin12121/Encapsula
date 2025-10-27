@@ -8,7 +8,6 @@ import * as os from "os";
 
 const term = termkit.terminal;
 
-
 type Screen = "upload" | "password" | "processing" | "complete";
 
 interface UploadedFile {
@@ -23,8 +22,8 @@ interface State {
   screen: Screen;
   uploadedFile: UploadedFile | null;
   inputBuffer: string;
-  password: string;
-  progress: number; 
+  password: Buffer | null;
+  progress: number;
   decryptedMessage?: string | null;
   error?: string | null;
 }
@@ -33,21 +32,26 @@ let state: State = {
   screen: "upload",
   uploadedFile: null,
   inputBuffer: "",
-  password: "",
+  password: null,
   progress: 0,
 };
 
+function secureWipeBuffer(buffer: Buffer | null) {
+  if (buffer) {
+    buffer.fill(0);
+  }
+}
 
-function deriveKey(password: string) {
-  const salt = crypto.createHash("sha256").update("encapsula-salt").digest();
+function deriveKey(password: string, salt: Buffer) {
   return crypto.pbkdf2Sync(password, salt, 100000, 32, "sha512");
 }
 
-function decryptPayload(payload: Buffer, password: string) {
-  if (payload.length < 16) throw new Error("Payload too short");
-  const iv = payload.slice(0, 16);
-  const encrypted = payload.slice(16);
-  const key = deriveKey(password);
+function decryptPayload(payload: Buffer, password: Buffer) {
+  if (payload.length < 48) throw new Error("Payload too short"); // 32 bytes salt + 16 bytes IV
+  const salt = payload.slice(0, 32);
+  const iv = payload.slice(32, 48);
+  const encrypted = payload.slice(48);
+  const key = deriveKey(password.toString("utf8"), salt);
   const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
   const out = Buffer.concat([decipher.update(encrypted), decipher.final()]);
   return out.toString("utf8");
@@ -116,7 +120,6 @@ if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 function sleep(ms: number) {
   return new Promise((res) => setTimeout(res, ms));
 }
-
 
 function renderUpload() {
   const lines: string[] = [];
@@ -250,7 +253,7 @@ async function processDecoding() {
 
       if (p === 66) {
         const extracted = extractGeneric(fileBuffer);
-        if (!extracted || extracted.length < 16) {
+        if (!extracted || extracted.length < 48) {
           state.error = "No hidden data found or data corrupted";
           state.screen = "complete";
           if ((global as any).showSection) {
@@ -262,7 +265,10 @@ async function processDecoding() {
         }
 
         try {
-          const decrypted = decryptPayload(extracted, state.password || "");
+          const decrypted = decryptPayload(
+            extracted,
+            state.password || Buffer.alloc(0),
+          );
           state.decryptedMessage = decrypted;
           state.error = null;
         } catch (e) {
@@ -289,7 +295,8 @@ async function processDecoding() {
 
     state.progress = 100;
     state.screen = "complete";
-    state.password = "";
+    secureWipeBuffer(state.password);
+    state.password = null;
     if ((global as any).showSection) {
       try {
         (global as any).showSection("Decode");
@@ -306,7 +313,6 @@ async function processDecoding() {
   }
 }
 
-
 export function handleDecodeInput(key: string, data?: any): boolean {
   const isEnter =
     key === "ENTER" ||
@@ -315,11 +321,12 @@ export function handleDecodeInput(key: string, data?: any): boolean {
     (data && (data.codepoint === 13 || data.codepoint === 10));
 
   if (key === "ESCAPE") {
+    secureWipeBuffer(state.password);
     state = {
       screen: "upload",
       uploadedFile: null,
       inputBuffer: "",
-      password: "",
+      password: null,
       progress: 0,
     };
     if ((global as any).showSection) {
@@ -329,7 +336,6 @@ export function handleDecodeInput(key: string, data?: any): boolean {
     }
     return true;
   }
-
 
   if (state.screen === "upload" && isEnter) {
     openFilePicker().then((filePath) => {
@@ -346,6 +352,8 @@ export function handleDecodeInput(key: string, data?: any): boolean {
           state.screen = "password";
           state.inputBuffer = "";
           state.progress = 0;
+          secureWipeBuffer(state.password);
+          state.password = null;
           if ((global as any).showSection) {
             try {
               (global as any).showSection("Decode");
@@ -368,7 +376,8 @@ export function handleDecodeInput(key: string, data?: any): boolean {
 
   if (state.screen === "password") {
     if (isEnter) {
-      state.password = state.inputBuffer;
+      secureWipeBuffer(state.password);
+      state.password = Buffer.from(state.inputBuffer, "utf8");
       state.inputBuffer = "";
       state.progress = 5;
       state.screen = "processing";
@@ -414,11 +423,12 @@ export function handleDecodeInput(key: string, data?: any): boolean {
   }
   if (state.screen === "complete") {
     if (key && key.length > 0) {
+      secureWipeBuffer(state.password);
       state = {
         screen: "upload",
         uploadedFile: null,
         inputBuffer: "",
-        password: "",
+        password: null,
         progress: 0,
       };
       if ((global as any).showSection) {
