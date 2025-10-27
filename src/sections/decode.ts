@@ -78,6 +78,268 @@ function extractGeneric(fileBuffer: Buffer): Buffer | null {
   }
 }
 
+/*
+  LSB extractor: reconstructs a sequence of bits from R,G,B LSBs in pixel order
+  Supports PNG (pngjs), JPEG (jpeg-js decoded RGBA), and simple BMP uncompressed.
+  Embedding format used by embedLSBImage: first 32 bits = payload byte length (big-endian),
+  followed by payload bytes (which for LSB/DCT embedding contains version+len+payload).
+*/
+function extractLSB(fileBuffer: Buffer): Buffer | null {
+  try {
+    // PNG path
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const PNG = require("pngjs").PNG as any;
+      const png = PNG.sync.read(fileBuffer);
+      const { width, height, data } = png; // data is RGBA
+      const totalPixels = width * height;
+      const capacityBits = totalPixels * 3;
+      // Read bits sequentially from R,G,B channels
+      const readBits = (neededBits: number) => {
+        const bits: number[] = [];
+        let bitIdx = 0;
+        for (let i = 0; i < data.length && bitIdx < neededBits; i += 4) {
+          if (bitIdx < neededBits) (bits.push(data[i] & 1), bitIdx++);
+          if (bitIdx < neededBits) (bits.push(data[i + 1] & 1), bitIdx++);
+          if (bitIdx < neededBits) (bits.push(data[i + 2] & 1), bitIdx++);
+        }
+        return bits;
+      };
+
+      // Get length (first 32 bits)
+      const lenBits = readBits(32);
+      if (lenBits.length < 32) return null;
+      let payloadLen = 0;
+      for (let i = 0; i < 32; i++)
+        payloadLen = (payloadLen << 1) | (lenBits[i] & 1);
+      if (payloadLen <= 0 || payloadLen > Math.floor((capacityBits - 32) / 8))
+        return null;
+
+      // Read payloadLen * 8 bits (starting after the first 32)
+      const allBits: number[] = [];
+      // Instead of re-reading the first 32 again, iterate and collect starting from 0 but skip 32 bits
+      let needBits = payloadLen * 8 + 32;
+      let collected: number[] = [];
+      let bIdx = 0;
+      for (let i = 0; i < data.length && bIdx < needBits; i += 4) {
+        if (bIdx < needBits) (collected.push(data[i] & 1), bIdx++);
+        if (bIdx < needBits) (collected.push(data[i + 1] & 1), bIdx++);
+        if (bIdx < needBits) (collected.push(data[i + 2] & 1), bIdx++);
+      }
+      if (collected.length < needBits) return null;
+      const payloadBits = collected.slice(32); // skip first 32 length bits
+      const bytes = Buffer.alloc(payloadLen);
+      for (let i = 0; i < payloadLen; i++) {
+        let val = 0;
+        for (let b = 0; b < 8; b++)
+          val = (val << 1) | (payloadBits[i * 8 + b] & 1);
+        bytes[i] = val;
+      }
+      return bytes;
+    } catch (e) {
+      // fall through to JPEG/BMP
+    }
+
+    try {
+      // JPEG path (decode to RGBA using jpeg-js)
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const jpeg = require("jpeg-js") as any;
+      const raw = jpeg.decode(fileBuffer, { useTArray: true }) as {
+        width: number;
+        height: number;
+        data: Buffer | Uint8Array;
+      };
+      if (!raw || !raw.data) throw new Error("Failed to decode JPEG");
+      const { width, height } = raw;
+      const data = Buffer.from(raw.data);
+      const totalPixels = width * height;
+      const capacityBits = totalPixels * 3;
+
+      // read as above
+      const needLenBits = 32;
+      const collectedAll: number[] = [];
+      for (let px = 0; px < width * height; px++) {
+        const base = px * 4;
+        collectedAll.push(data[base] & 1);
+        collectedAll.push(data[base + 1] & 1);
+        collectedAll.push(data[base + 2] & 1);
+      }
+      if (collectedAll.length < 32) return null;
+      let payloadLen = 0;
+      for (let i = 0; i < 32; i++)
+        payloadLen = (payloadLen << 1) | (collectedAll[i] & 1);
+      if (payloadLen <= 0 || payloadLen > Math.floor((capacityBits - 32) / 8))
+        return null;
+      const needBits = 32 + payloadLen * 8;
+      if (collectedAll.length < needBits) return null;
+      const payloadBits = collectedAll.slice(32, 32 + payloadLen * 8);
+      const bytes = Buffer.alloc(payloadLen);
+      for (let i = 0; i < payloadLen; i++) {
+        let val = 0;
+        for (let b = 0; b < 8; b++)
+          val = (val << 1) | (payloadBits[i * 8 + b] & 1);
+        bytes[i] = val;
+      }
+      return bytes;
+    } catch (e) {
+      // fall through to BMP
+    }
+
+    // BMP fallback (simple uncompressed BMP 24/32bpp)
+    try {
+      if (fileBuffer.slice(0, 2).toString("ascii") === "BM") {
+        const pixelOffset = fileBuffer.readUInt32LE(10);
+        const bpp = fileBuffer.readUInt16LE(28);
+        const bytesPerPixel = bpp / 8;
+        if (bpp !== 24 && bpp !== 32) return null;
+        const pixelData = Buffer.from(fileBuffer.slice(pixelOffset));
+        const totalPixels = Math.floor(pixelData.length / bytesPerPixel);
+        const capacityBits = totalPixels * 3;
+        const collectedAll: number[] = [];
+        for (let px = 0; px < totalPixels; px++) {
+          const base = px * bytesPerPixel;
+          // BMP order B,G,R
+          collectedAll.push(pixelData[base + 2] & 1);
+          collectedAll.push(pixelData[base + 1] & 1);
+          collectedAll.push(pixelData[base] & 1);
+        }
+        if (collectedAll.length < 32) return null;
+        let payloadLen = 0;
+        for (let i = 0; i < 32; i++)
+          payloadLen = (payloadLen << 1) | (collectedAll[i] & 1);
+        if (payloadLen <= 0 || payloadLen > Math.floor((capacityBits - 32) / 8))
+          return null;
+        const needBits = 32 + payloadLen * 8;
+        if (collectedAll.length < needBits) return null;
+        const payloadBits = collectedAll.slice(32, 32 + payloadLen * 8);
+        const bytes = Buffer.alloc(payloadLen);
+        for (let i = 0; i < payloadLen; i++) {
+          let val = 0;
+          for (let b = 0; b < 8; b++)
+            val = (val << 1) | (payloadBits[i * 8 + b] & 1);
+          bytes[i] = val;
+        }
+        return bytes;
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/*
+  DCT extractor (JPEG only):
+  - Mirror the embedding process: iterate 8x8 Y blocks left-to-right, top-to-bottom
+  - For each block compute DCT and read LSB of rounded coefficient at target (u=1,v=0)
+  - First 32 bits represent payload length in bytes (big-endian), then read that many bytes.
+*/
+function extractDCT(fileBuffer: Buffer): Buffer | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const jpeg = require("jpeg-js") as any;
+    const raw = jpeg.decode(fileBuffer, { useTArray: true }) as {
+      width: number;
+      height: number;
+      data: Buffer | Uint8Array;
+    };
+    if (!raw || !raw.data) return null;
+    const { width, height } = raw;
+    const rgba = Buffer.from(raw.data);
+
+    // build Y channel
+    const Y: number[][] = Array.from({ length: height }, () =>
+      Array(width).fill(0),
+    );
+    let idx = 0;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const r = rgba[idx++];
+        const g = rgba[idx++];
+        const b = rgba[idx++];
+        idx++;
+        const yc = 0.299 * r + 0.587 * g + 0.114 * b;
+        Y[y][x] = yc - 128; // shift to center
+      }
+    }
+
+    const blocksX = Math.floor(width / 8);
+    const blocksY = Math.floor(height / 8);
+    const capacityBits = blocksX * blocksY;
+    if (capacityBits < 32) return null; // at least should hold length
+
+    // DCT helper (same as encoder)
+    function dct8(block: number[][]) {
+      const N = 8;
+      const F: number[][] = Array.from({ length: N }, () => Array(N).fill(0));
+      for (let u = 0; u < N; u++) {
+        for (let v = 0; v < N; v++) {
+          let sum = 0;
+          for (let x = 0; x < N; x++) {
+            for (let y = 0; y < N; y++) {
+              sum +=
+                block[x][y] *
+                Math.cos(((2 * x + 1) * u * Math.PI) / (2 * N)) *
+                Math.cos(((2 * y + 1) * v * Math.PI) / (2 * N));
+            }
+          }
+          const cu = u === 0 ? 1 / Math.sqrt(2) : 1;
+          const cv = v === 0 ? 1 / Math.sqrt(2) : 1;
+          F[u][v] = 0.25 * cu * cv * sum;
+        }
+      }
+      return F;
+    }
+
+    // read bits from blocks
+    const bits: number[] = [];
+    const targetU = 1,
+      targetV = 0;
+    for (let by = 0; by < blocksY; by++) {
+      for (let bx = 0; bx < blocksX; bx++) {
+        // extract 8x8 block
+        const block: number[][] = Array.from({ length: 8 }, () =>
+          Array(8).fill(0),
+        );
+        for (let i = 0; i < 8; i++) {
+          for (let j = 0; j < 8; j++) {
+            block[i][j] = Y[by * 8 + i][bx * 8 + j];
+          }
+        }
+        const F = dct8(block);
+        const q = Math.round(F[targetU][targetV]);
+        bits.push(q & 1);
+      }
+    }
+
+    // need at least 32 bits for length
+    if (bits.length < 32) return null;
+    let payloadLen = 0;
+    for (let i = 0; i < 32; i++) payloadLen = (payloadLen << 1) | (bits[i] & 1);
+    if (payloadLen <= 0 || payloadLen > Math.floor((bits.length - 32) / 8)) {
+      // if declared length not sensible, abort
+      return null;
+    }
+
+    const neededBits = 32 + payloadLen * 8;
+    if (bits.length < neededBits) return null;
+    const payloadBits = bits.slice(32, 32 + payloadLen * 8);
+    const bytes = Buffer.alloc(payloadLen);
+    for (let i = 0; i < payloadLen; i++) {
+      let val = 0;
+      for (let b = 0; b < 8; b++)
+        val = (val << 1) | (payloadBits[i * 8 + b] & 1);
+      bytes[i] = val;
+    }
+    return bytes;
+  } catch (e) {
+    return null;
+  }
+}
+
 function openFilePicker(): Promise<string | null> {
   return new Promise((resolve) => {
     const ps = `
@@ -252,28 +514,90 @@ async function processDecoding() {
       state.progress = p;
 
       if (p === 66) {
-        const extracted = extractGeneric(fileBuffer);
-        if (!extracted || extracted.length < 48) {
-          state.error = "No hidden data found or data corrupted";
-          state.screen = "complete";
-          if ((global as any).showSection) {
-            try {
-              (global as any).showSection("Decode");
-            } catch {}
+        // Try extractors in order and attempt decryption for each result.
+        // Continue to next extractor if extraction or decryption fails.
+        const extractorList: {
+          name: string;
+          fn: (buf: Buffer) => Buffer | null;
+        }[] = [
+          { name: "DCT", fn: extractDCT },
+          { name: "LSB", fn: extractLSB },
+          { name: "APPEND", fn: extractGeneric },
+        ];
+
+        const attempts: string[] = [];
+        const errors: string[] = [];
+        let success = false;
+
+        for (const extractor of extractorList) {
+          attempts.push(extractor.name);
+          let extracted: Buffer | null = null;
+          try {
+            extracted = extractor.fn(fileBuffer);
+          } catch (er) {
+            extracted = null;
           }
-          return;
+
+          if (!extracted || extracted.length === 0) {
+            errors.push(`${extractor.name}: no payload extracted`);
+            continue;
+          }
+
+          // Determine payload buffer: check for encoder header (version(4) + len(4) + payload)
+          let payloadBuf: Buffer | null = null;
+          let declaredLen: number | null = null;
+          if (extracted.length >= 8) {
+            try {
+              const maybeLen = extracted.readUInt32BE(4);
+              declaredLen = maybeLen;
+              if (
+                Number.isFinite(maybeLen) &&
+                maybeLen >= 0 &&
+                extracted.length >= 8 + maybeLen
+              ) {
+                payloadBuf = extracted.slice(8, 8 + maybeLen);
+              } else {
+                // treat as legacy generic payload (salt||iv||ciphertext)
+                payloadBuf = extracted;
+              }
+            } catch {
+              payloadBuf = extracted;
+            }
+          } else {
+            payloadBuf = extracted;
+          }
+
+          if (!payloadBuf || payloadBuf.length < 48) {
+            errors.push(
+              `${extractor.name}: extracted payload too small (extractedLen=${extracted.length}, declaredLen=${
+                declaredLen === null ? "n/a" : declaredLen
+              }, payloadLen=${payloadBuf ? payloadBuf.length : 0})`,
+            );
+            continue;
+          }
+
+          // Try decrypting this candidate payload
+          try {
+            const decrypted = decryptPayload(
+              payloadBuf,
+              state.password || Buffer.alloc(0),
+            );
+            state.decryptedMessage =
+              `[detected: ${extractor.name}]\n` + decrypted;
+            state.error = null;
+            success = true;
+            break; // done
+          } catch (e) {
+            errors.push(`${extractor.name}: decryption failed`);
+            // continue to next extractor
+            continue;
+          }
         }
 
-        try {
-          const decrypted = decryptPayload(
-            extracted,
-            state.password || Buffer.alloc(0),
-          );
-          state.decryptedMessage = decrypted;
-          state.error = null;
-        } catch (e) {
-          state.error = "Incorrect password or corrupted data";
-          state.decryptedMessage = null;
+        if (!success) {
+          state.error = `Failed to extract/decrypt (tried: ${attempts.join(
+            ", ",
+          )}). Details: ${errors.join("; ")}`;
           state.screen = "complete";
           if ((global as any).showSection) {
             try {

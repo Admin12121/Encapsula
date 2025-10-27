@@ -120,6 +120,15 @@ function showSection(name: string): void {
       return;
   }
 
+  // Allow sections to request left-alignment by prefixing their returned content
+  // with the marker string: [[LEFT_ALIGN]]\n
+  // If present, the section will be rendered left-aligned inside the content frame.
+  let leftAlign = false;
+  if (typeof content === "string" && content.startsWith("[[LEFT_ALIGN]]\n")) {
+    leftAlign = true;
+    content = content.replace("[[LEFT_ALIGN]]\n", "");
+  }
+
   let rawLines = content.toString().split("\n");
   while (rawLines.length > 0 && rawLines[0].trim() === "") rawLines.shift();
   while (rawLines.length > 0 && rawLines[rawLines.length - 1].trim() === "")
@@ -161,8 +170,11 @@ function showSection(name: string): void {
   }
 
   const maxVisible = visibleLens.length > 0 ? Math.max(...visibleLens) : 0;
-  const leftAnchor =
-    vp.x + 2 + Math.max(0, Math.floor((innerWidth - maxVisible) / 2));
+
+  // If leftAlign marker is present, anchor at left edge inside frame; otherwise center as before
+  const leftAnchor = leftAlign
+    ? vp.x + 2
+    : vp.x + 2 + Math.max(0, Math.floor((innerWidth - maxVisible) / 2));
 
   for (let i = 0; i < displayLines; i++) {
     let raw = lines[startLineIndex + i] || "";
@@ -173,7 +185,10 @@ function showSection(name: string): void {
       raw = visible;
     }
 
-    const extraPad = Math.max(0, Math.floor((maxVisible - visible.length) / 2));
+    // If leftAligned, don't add extra padding per line; otherwise center each line in the block
+    const extraPad = leftAlign
+      ? 0
+      : Math.max(0, Math.floor((maxVisible - visible.length) / 2));
     const x = leftAnchor + extraPad;
     term.moveTo(x, startY + i);
     term(raw);
