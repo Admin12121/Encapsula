@@ -152,6 +152,17 @@ function makePayload(messageBuffer: Buffer) {
 }
 
 async function embedLSBImage(fileBuffer: Buffer, payload: Buffer, ext: string) {
+  // LSB embedding into JPEG is not reliable because JPEG is lossy and
+  // re-encoding will destroy bit-level LSB payloads. Refuse to attempt
+  // LSB on JPEG hosts and instruct the caller to use DCT instead.
+  const extLower = (ext || "").toLowerCase();
+  const isJpegMagic = fileBuffer.slice(0, 2).toString("hex") === "ffd8";
+  if (extLower === ".jpg" || extLower === ".jpeg" || isJpegMagic) {
+    throw new Error(
+      "LSB embedding into JPEG is not supported (JPEG is lossy). Use the 'dct' method for JPEG images.",
+    );
+  }
+
   const payloadWithHeader = makePayload(payload);
   // Convert to bits
   const bits: number[] = [];
@@ -442,6 +453,18 @@ async function embedDataToFile(
 ) {
   if (!method) throw new Error("No steganography method selected");
   if (method === "lsb") {
+    // Prevent attempting LSB embedding on JPEG hosts; LSB is only safe on
+    // lossless formats (PNG/BMP). Provide a clear error so the caller
+    // and UI can present the right guidance.
+    const maybeIsJpeg =
+      (ext || "").toLowerCase() === ".jpg" ||
+      (ext || "").toLowerCase() === ".jpeg" ||
+      fileBuffer.slice(0, 2).toString("hex") === "ffd8";
+    if (maybeIsJpeg) {
+      throw new Error(
+        "LSB embedding is not supported for JPEG images. Use 'dct' method for JPEG hosts.",
+      );
+    }
     return await embedLSBImage(fileBuffer, payload, ext);
   } else if (method === "dct") {
     const maybeIsJpeg =
@@ -584,13 +607,17 @@ function renderMethodSelection() {
   lines.push("");
   lines.push("");
   const hint = chalk.dim(" » Space to select. Enter to submit.");
-  lines.push("                        Which method would you like to use? " + hint);
+  lines.push(
+    "                        Which method would you like to use? " + hint,
+  );
   lines.push("");
   const sel = state.method || "lsb";
-  const lsbMark = sel === "lsb" ? chalk.hex("#f97316")("(*)"): "( )";
+  const lsbMark = sel === "lsb" ? chalk.hex("#f97316")("(*)") : "( )";
   const dctMark = sel === "dct" ? chalk.hex("#f97316")("(*)") : "( )";
   lines.push("                        " + lsbMark + " LSB Insertion");
-  lines.push("                        " + dctMark + " DCT Coefficient Manipulation");
+  lines.push(
+    "                        " + dctMark + " DCT Coefficient Manipulation",
+  );
   lines.push("");
   return marker + lines.join("\n");
 }

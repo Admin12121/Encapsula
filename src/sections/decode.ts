@@ -46,7 +46,7 @@ function deriveKey(password: string, salt: Buffer) {
   return crypto.pbkdf2Sync(password, salt, 100000, 32, "sha512");
 }
 
-function decryptPayload(payload: Buffer, password: Buffer) {
+export function decryptPayload(payload: Buffer, password: Buffer) {
   if (payload.length < 48) throw new Error("Payload too short"); // 32 bytes salt + 16 bytes IV
   const salt = payload.slice(0, 32);
   const iv = payload.slice(32, 48);
@@ -57,10 +57,12 @@ function decryptPayload(payload: Buffer, password: Buffer) {
   return out.toString("utf8");
 }
 
-function extractGeneric(fileBuffer: Buffer): Buffer | null {
+export function extractGeneric(fileBuffer: Buffer): Buffer | null {
   try {
     const marker = Buffer.from("<<ENCAPSULA_HIDDEN>>", "utf8");
-    const startIndex = fileBuffer.indexOf(marker);
+    // Prefer the last occurrence of the marker so appended payloads at EOF are detected
+    // and accidental occurrences earlier in the file do not cause incorrect extraction.
+    const startIndex = fileBuffer.lastIndexOf(marker);
     if (startIndex === -1) return null;
 
     const lengthStart = startIndex + marker.length;
@@ -84,7 +86,7 @@ function extractGeneric(fileBuffer: Buffer): Buffer | null {
   Embedding format used by embedLSBImage: first 32 bits = payload byte length (big-endian),
   followed by payload bytes (which for LSB/DCT embedding contains version+len+payload).
 */
-function extractLSB(fileBuffer: Buffer): Buffer | null {
+export function extractLSB(fileBuffer: Buffer): Buffer | null {
   try {
     // PNG path
     try {
@@ -237,7 +239,7 @@ function extractLSB(fileBuffer: Buffer): Buffer | null {
   - For each block compute DCT and read LSB of rounded coefficient at target (u=1,v=0)
   - First 32 bits represent payload length in bytes (big-endian), then read that many bytes.
 */
-function extractDCT(fileBuffer: Buffer): Buffer | null {
+export function extractDCT(fileBuffer: Buffer): Buffer | null {
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const jpeg = require("jpeg-js") as any;
@@ -520,9 +522,10 @@ async function processDecoding() {
           name: string;
           fn: (buf: Buffer) => Buffer | null;
         }[] = [
+          // Check for appended payload first (fast, reliable fallback)
+          { name: "APPEND", fn: extractGeneric },
           { name: "DCT", fn: extractDCT },
           { name: "LSB", fn: extractLSB },
-          { name: "APPEND", fn: extractGeneric },
         ];
 
         const attempts: string[] = [];
@@ -543,21 +546,25 @@ async function processDecoding() {
             continue;
           }
 
-          // Determine payload buffer: check for encoder header (version(4) + len(4) + payload)
           let payloadBuf: Buffer | null = null;
           let declaredLen: number | null = null;
           if (extracted.length >= 8) {
             try {
+              const version = extracted.readUInt32BE(0);
               const maybeLen = extracted.readUInt32BE(4);
               declaredLen = maybeLen;
+              // If version is 1 and length is sensible, unwrap the payload
               if (
+                version === 1 &&
                 Number.isFinite(maybeLen) &&
-                maybeLen >= 0 &&
+                maybeLen > 0 &&
+                maybeLen <= 10 * 1024 * 1024 &&
                 extracted.length >= 8 + maybeLen
               ) {
+                // Wrapped payload: version(4) + len(4) + [salt+iv+encrypted]
                 payloadBuf = extracted.slice(8, 8 + maybeLen);
               } else {
-                // treat as legacy generic payload (salt||iv||ciphertext)
+                // Unwrapped payload (generic append): salt+iv+encrypted directly
                 payloadBuf = extracted;
               }
             } catch {
