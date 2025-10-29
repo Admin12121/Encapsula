@@ -1,33 +1,17 @@
 import chalk from "chalk";
 import termkit from "terminal-kit";
-import * as fs from "fs";
 import * as path from "path";
-import * as crypto from "crypto";
-import { execFileSync } from "child_process";
 import * as os from "os";
+import fs from "fs/promises";
+import fssync from "fs";
+import crypto from "crypto";
+import { PNG } from "pngjs";
+import { pickCarrierFile } from "../ui/filePicker";
 
 const term = termkit.terminal;
 
-/*
-  Encode section - now supports selectable real steganography methods:
-  - LSB (Least Significant Bit) insertion into image pixel channels (PNG/JPEG/BMP when supported)
-  - DCT coefficient manipulation for JPEG images (requires jpeg-js)
-
-  Flow:
-  - Upload -> Choose method -> Message -> Password -> Processing -> Complete
-  - Message textarea supports multiple lines (ENTER inserts newline). Finish with Ctrl+S.
-*/
-
-// Types & State
-type Screen =
-  | "upload"
-  | "method"
-  | "message"
-  | "password"
-  | "processing"
-  | "complete";
-
-type Method = "lsb" | "dct" | null;
+// Screens for step-by-step wizard
+type Screen = "upload" | "message" | "password" | "processing" | "complete";
 
 interface UploadedFile {
   path: string;
@@ -38,552 +22,74 @@ interface UploadedFile {
 
 interface State {
   screen: Screen;
-  method: Method;
   uploadedFile: UploadedFile | null;
+  inputBuffer: string;
   message: string;
   password: Buffer | null;
-  inputBuffer: string;
   outputPath: string;
   progress: number;
   intermediateWritten: boolean;
   downloadedPath?: string;
   error?: string;
+  pathEntryMode: boolean; // for Linux/macOS path typing UX
 }
 
 let state: State = {
   screen: "upload",
-  method: null,
   uploadedFile: null,
+  inputBuffer: "",
   message: "",
   password: null,
-  inputBuffer: "",
   outputPath: "",
   progress: 0,
   intermediateWritten: false,
+  pathEntryMode: false,
 };
 
-// Utility functions
+// ===== Shared crypto/header constants (must match Decode) =====
+const MAGIC = Buffer.from("ECAP", "ascii"); // 4
+const VERSION = 0x01;
+
+// Header: 60 bytes total
+// magic(4) + ver(1) + flags(1) + bits(1) + channels(1) + payloadLen(4)
+// + kdf(1) + logN(1) + r(1) + p(1) + salt(16) + iv(12) + tag(16)
+const HEADER_SIZE = 60;
+
+const FLAG_ENCRYPTED = 1 << 0; // always set
+const FLAG_RANDOMIZED = 1 << 1; // PNG randomized payload
+
+const CHANNELS_MASK_RGB = 0b00000111;
+
+const KDF_SCRYPT = 1;
+// Prefer strong params but be adaptive on low-memory boxes
+const SCRYPT_LOGN_PREFERRED = 15; // 2^15
+const SCRYPT_R = 8;
+const SCRYPT_P = 1;
+
+// ===== Utils =====
 function secureWipeBuffer(buffer: Buffer | null) {
-  if (buffer) {
-    buffer.fill(0);
-  }
+  if (buffer) buffer.fill(0);
 }
-
-function stripAnsi(s: string) {
-  return s.replace(/\x1b\[[0-9;]*m/g, "");
-}
-
-function openFilePicker(): Promise<string | null> {
-  return new Promise((resolve) => {
-    const ps = `
-Add-Type -AssemblyName System.Windows.Forms
-$dlg = New-Object System.Windows.Forms.OpenFileDialog
-$dlg.Title = "Select a file to encode"
-$dlg.Filter = "All Files (*.*)|*.*"
-$dlg.InitialDirectory = [Environment]::GetFolderPath('MyDocuments')
-if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  [Console]::Write($dlg.FileName)
-}
-`.trim();
-    const tmp = path.join(os.tmpdir(), `encap_open_${Date.now()}.ps1`);
-    try {
-      fs.writeFileSync(tmp, ps, "utf8");
-      const out = execFileSync(
-        "powershell.exe",
-        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp],
-        {
-          encoding: "utf8",
-          windowsHide: true,
-        },
-      )
-        .toString()
-        .trim();
-      try {
-        fs.unlinkSync(tmp);
-      } catch {}
-      if (out && fs.existsSync(out)) resolve(out);
-      else resolve(null);
-    } catch {
-      try {
-        if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-      } catch {}
-      resolve(null);
-    }
-  });
-}
-
-function makeOutputPath(inPath: string) {
-  const dir = path.dirname(inPath);
-  const base = path.basename(inPath);
-  const ext = path.extname(base) || ".bin";
-  const name = path.basename(base, ext);
-  return path.join(dir, `${name}_encoded${ext}`);
-}
-
-function deriveKey(password: string, salt: Buffer) {
-  return crypto.pbkdf2Sync(password, salt, 100000, 32, "sha512");
-}
-
-function encryptMessage(message: string, password: Buffer) {
-  const salt = crypto.randomBytes(32);
-  const key = deriveKey(password.toString("utf8"), salt);
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-  const encrypted = Buffer.concat([
-    cipher.update(message, "utf8"),
-    cipher.final(),
-  ]);
-  return { salt, iv, encrypted };
-}
-
-function embedGeneric(fileBuffer: Buffer, data: Buffer) {
-  const marker = Buffer.from("<<ENCAPSULA_HIDDEN>>", "utf8");
-  const lenBuf = Buffer.alloc(4);
-  lenBuf.writeUInt32BE(data.length, 0);
-  return Buffer.concat([fileBuffer, marker, lenBuf, data, marker]);
-}
-
-function makePayload(messageBuffer: Buffer) {
-  const version = Buffer.alloc(4);
-  version.writeUInt32BE(1, 0);
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(messageBuffer.length, 0);
-  return Buffer.concat([version, len, messageBuffer]);
-}
-
-async function embedLSBImage(fileBuffer: Buffer, payload: Buffer, ext: string) {
-  // LSB embedding into JPEG is not reliable because JPEG is lossy and
-  // re-encoding will destroy bit-level LSB payloads. Refuse to attempt
-  // LSB on JPEG hosts and instruct the caller to use DCT instead.
-  const extLower = (ext || "").toLowerCase();
-  const isJpegMagic = fileBuffer.slice(0, 2).toString("hex") === "ffd8";
-  if (extLower === ".jpg" || extLower === ".jpeg" || isJpegMagic) {
-    throw new Error(
-      "LSB embedding into JPEG is not supported (JPEG is lossy). Use the 'dct' method for JPEG images.",
-    );
-  }
-
-  const payloadWithHeader = makePayload(payload);
-  // Convert to bits
-  const bits: number[] = [];
-  for (let i = 0; i < payloadWithHeader.length; i++) {
-    const byte = payloadWithHeader[i];
-    for (let b = 7; b >= 0; b--) bits.push((byte >> b) & 1);
-  }
-
-  try {
-    const PNG = require("pngjs").PNG as any;
-    const png = PNG.sync.read(fileBuffer);
-    const { width, height, data } = png;
-    const capacity = width * height * 3;
-    if (bits.length + 32 > capacity) {
-      throw new Error("Not enough capacity in PNG image for payload");
-    }
-    const lenBits: number[] = [];
-    const payloadLen = payloadWithHeader.length;
-    for (let i = 31; i >= 0; i--) lenBits.push((payloadLen >> i) & 1);
-    const allBits = lenBits.concat(bits);
-
-    let bitIdx = 0;
-    for (let i = 0; i < data.length && bitIdx < allBits.length; i += 4) {
-      // R
-      if (bitIdx < allBits.length) {
-        data[i] = (data[i] & 0xfe) | allBits[bitIdx++];
-      }
-      // G
-      if (bitIdx < allBits.length) {
-        data[i + 1] = (data[i + 1] & 0xfe) | allBits[bitIdx++];
-      }
-      // B
-      if (bitIdx < allBits.length) {
-        data[i + 2] = (data[i + 2] & 0xfe) | allBits[bitIdx++];
-      }
-    }
-    const out = PNG.sync.write({ width, height, data });
-    return out as Buffer;
-  } catch (e) {
-    // PNG support not available or failed; fall through to JPEG/BMP attempts
-  }
-
-  try {
-    const jpeg = require("jpeg-js") as any;
-    const raw = jpeg.decode(fileBuffer, { useTArray: true }) as {
-      width: number;
-      height: number;
-      data: Buffer | Uint8Array;
-    };
-    if (!raw || !raw.data) throw new Error("Failed to decode JPEG");
-    const { width, height } = raw;
-    const data = Buffer.from(raw.data);
-    const stride = 4;
-    const capacity = width * height * 3;
-    if (bits.length + 32 > capacity) {
-      throw new Error("Not enough capacity in JPEG image for payload");
-    }
-    const lenBits: number[] = [];
-    const payloadLen = payloadWithHeader.length;
-    for (let i = 31; i >= 0; i--) lenBits.push((payloadLen >> i) & 1);
-    const allBits = lenBits.concat(bits);
-
-    let bitIdx = 0;
-    for (let px = 0; px < width * height && bitIdx < allBits.length; px++) {
-      const base = px * stride;
-      // R
-      if (bitIdx < allBits.length) {
-        data[base] = (data[base] & 0xfe) | allBits[bitIdx++];
-      }
-      // G
-      if (bitIdx < allBits.length) {
-        data[base + 1] = (data[base + 1] & 0xfe) | allBits[bitIdx++];
-      }
-      // B
-      if (bitIdx < allBits.length) {
-        data[base + 2] = (data[base + 2] & 0xfe) | allBits[bitIdx++];
-      }
-      // skip alpha channel if present
-    }
-    const encoded = jpeg.encode({ data, width, height }, 90);
-    return Buffer.from(encoded.data);
-  } catch (e) {
-    // jpeg-js not available or failed
-  }
-
-  try {
-    if (fileBuffer.slice(0, 2).toString("ascii") === "BM") {
-      const pixelOffset = fileBuffer.readUInt32LE(10);
-      const dibHeaderSize = fileBuffer.readUInt32LE(14);
-      const width = fileBuffer.readInt32LE(18);
-      const height = fileBuffer.readInt32LE(22);
-      const bpp = fileBuffer.readUInt16LE(28);
-      if (bpp !== 24 && bpp !== 32)
-        throw new Error("Unsupported BMP bpp for LSB");
-      const pixelData = Buffer.from(fileBuffer.slice(pixelOffset));
-      const capacity = Math.floor((pixelData.length / (bpp / 8)) * 3);
-      if (bits.length + 32 > capacity)
-        throw new Error("Not enough capacity in BMP image for payload");
-
-      const lenBits: number[] = [];
-      const payloadLen = payloadWithHeader.length;
-      for (let i = 31; i >= 0; i--) lenBits.push((payloadLen >> i) & 1);
-      const allBits = lenBits.concat(bits);
-
-      let bitIdx = 0;
-      const bytesPerPixel = bpp / 8;
-      for (
-        let px = 0;
-        px < pixelData.length && bitIdx < allBits.length;
-        px += bytesPerPixel
-      ) {
-        for (let c = 0; c < 3 && bitIdx < allBits.length; c++) {
-          const idx = px + c;
-          pixelData[idx] = (pixelData[idx] & 0xfe) | allBits[bitIdx++];
-        }
-      }
-      const out = Buffer.concat([fileBuffer.slice(0, pixelOffset), pixelData]);
-      return out;
-    }
-  } catch (e) {
-    // ignore
-  }
-
-  // If none of above worked, fallback to generic append (not real stego)
-  throw new Error(
-    "No supported image libraries available for LSB embedding. Install 'pngjs' or 'jpeg-js' to enable real LSB embedding, or choose a different host file.",
-  );
-}
-
-async function embedDCTInJpeg(fileBuffer: Buffer, payload: Buffer) {
-  const jpeg = require("jpeg-js") as any;
-  const raw = jpeg.decode(fileBuffer, { useTArray: true }) as {
-    width: number;
-    height: number;
-    data: Buffer | Uint8Array;
-  };
-  if (!raw || !raw.data)
-    throw new Error("Failed to decode JPEG for DCT embedding");
-  const { width, height } = raw;
-  const data = Buffer.from(raw.data); // RGBA
-
-  const yChannel = new Float32Array(width * height);
-  const cbChannel = new Float32Array(width * height);
-  const crChannel = new Float32Array(width * height);
-
-  for (let i = 0, pix = 0; i < width * height; i++, pix += 4) {
-    const r = data[pix];
-    const g = data[pix + 1];
-    const b = data[pix + 2];
-    // ITU-R BT.601 conversion
-    const y = 0.299 * r + 0.587 * g + 0.114 * b;
-    const cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128;
-    const cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128;
-    yChannel[i] = y;
-    cbChannel[i] = cb;
-    crChannel[i] = cr;
-  }
-
-  // Build payload bits
-  const payloadWithHeader = makePayload(payload);
-  const bits: number[] = [];
-  for (let i = 0; i < payloadWithHeader.length; i++) {
-    const byte = payloadWithHeader[i];
-    for (let b = 7; b >= 0; b--) bits.push((byte >> b) & 1);
-  }
-  // We'll store payload length (32 bits) then bits
-  const lenBits: number[] = [];
-  const payloadLen = payloadWithHeader.length;
-  for (let i = 31; i >= 0; i--) lenBits.push((payloadLen >> i) & 1);
-  const allBits = lenBits.concat(bits);
-
-  // DCT helpers (8x8)
-  function dct8(block: number[][]) {
-    const N = 8;
-    const F: number[][] = Array.from({ length: 8 }, () => Array(8).fill(0));
-    for (let u = 0; u < N; u++) {
-      for (let v = 0; v < N; v++) {
-        let sum = 0;
-        for (let x = 0; x < N; x++) {
-          for (let y = 0; y < N; y++) {
-            sum +=
-              block[x][y] *
-              Math.cos(((2 * x + 1) * u * Math.PI) / (2 * N)) *
-              Math.cos(((2 * y + 1) * v * Math.PI) / (2 * N));
-          }
-        }
-        const cu = u === 0 ? 1 / Math.sqrt(2) : 1;
-        const cv = v === 0 ? 1 / Math.sqrt(2) : 1;
-        F[u][v] = 0.25 * cu * cv * sum;
-      }
-    }
-    return F;
-  }
-  function idct8(F: number[][]) {
-    const N = 8;
-    const block: number[][] = Array.from({ length: 8 }, () => Array(8).fill(0));
-    for (let x = 0; x < N; x++) {
-      for (let y = 0; y < N; y++) {
-        let sum = 0;
-        for (let u = 0; u < N; u++) {
-          for (let v = 0; v < N; v++) {
-            const cu = u === 0 ? 1 / Math.sqrt(2) : 1;
-            const cv = v === 0 ? 1 / Math.sqrt(2) : 1;
-            sum +=
-              cu *
-              cv *
-              F[u][v] *
-              Math.cos(((2 * x + 1) * u * Math.PI) / (2 * N)) *
-              Math.cos(((2 * y + 1) * v * Math.PI) / (2 * N));
-          }
-        }
-        block[x][y] = 0.25 * sum;
-      }
-    }
-    return block;
-  }
-
-  let bitIdx = 0;
-  const blocksX = Math.floor(width / 8);
-  const blocksY = Math.floor(height / 8);
-  if (blocksX * blocksY * 1 < allBits.length) {
-    throw new Error("Image too small for DCT embedding of this payload");
-  }
-
-  for (let by = 0; by < blocksY && bitIdx < allBits.length; by++) {
-    for (let bx = 0; bx < blocksX && bitIdx < allBits.length; bx++) {
-      // extract 8x8 block for Y channel
-      const block: number[][] = Array.from({ length: 8 }, () =>
-        Array(8).fill(0),
-      );
-      for (let i = 0; i < 8; i++) {
-        for (let j = 0; j < 8; j++) {
-          const px = bx * 8 + j;
-          const py = by * 8 + i;
-          block[i][j] = yChannel[py * width + px] - 128; // shift
-        }
-      }
-      const F = dct8(block);
-      const targetU = 1,
-        targetV = 0;
-      let coeff = F[targetU][targetV];
-
-      const q = Math.round(coeff);
-      const desiredBit = allBits[bitIdx++];
-      let newQ = (q & ~1) | desiredBit;
-      if (newQ !== q) {
-        F[targetU][targetV] = newQ;
-      } else {
-        F[targetU][targetV] = q;
-      }
-      const inv = idct8(F);
-      for (let i = 0; i < 8; i++) {
-        for (let j = 0; j < 8; j++) {
-          const px = bx * 8 + j;
-          const py = by * 8 + i;
-          const val = inv[i][j] + 128;
-          const clamped = Math.max(0, Math.min(255, Math.round(val)));
-          yChannel[py * width + px] = clamped;
-        }
-      }
-    }
-  }
-
-  for (let i = 0, pix = 0; i < width * height; i++, pix += 4) {
-    const y = yChannel[i];
-    const cb = cbChannel[i] - 128;
-    const cr = crChannel[i] - 128;
-    let r = y + 1.402 * cr;
-    let g = y - 0.344136 * cb - 0.714136 * cr;
-    let b = y + 1.772 * cb;
-    r = Math.max(0, Math.min(255, Math.round(r)));
-    g = Math.max(0, Math.min(255, Math.round(g)));
-    b = Math.max(0, Math.min(255, Math.round(b)));
-    data[pix] = r;
-    data[pix + 1] = g;
-    data[pix + 2] = b;
-  }
-
-  const encoded = jpeg.encode({ data, width, height }, 90);
-  return Buffer.from(encoded.data);
-}
-
-async function embedDataToFile(
-  fileBuffer: Buffer,
-  ext: string,
-  method: Method,
-  payload: Buffer,
-) {
-  if (!method) throw new Error("No steganography method selected");
-  if (method === "lsb") {
-    // Prevent attempting LSB embedding on JPEG hosts; LSB is only safe on
-    // lossless formats (PNG/BMP). Provide a clear error so the caller
-    // and UI can present the right guidance.
-    const maybeIsJpeg =
-      (ext || "").toLowerCase() === ".jpg" ||
-      (ext || "").toLowerCase() === ".jpeg" ||
-      fileBuffer.slice(0, 2).toString("hex") === "ffd8";
-    if (maybeIsJpeg) {
-      throw new Error(
-        "LSB embedding is not supported for JPEG images. Use 'dct' method for JPEG hosts.",
-      );
-    }
-    return await embedLSBImage(fileBuffer, payload, ext);
-  } else if (method === "dct") {
-    const maybeIsJpeg =
-      ext.toLowerCase() === ".jpg" ||
-      ext.toLowerCase() === ".jpeg" ||
-      fileBuffer.slice(0, 2).toString("hex") === "ffd8";
-    if (!maybeIsJpeg)
-      throw new Error(
-        "DCT embedding is currently only supported for JPEG images",
-      );
-    return await embedDCTInJpeg(fileBuffer, payload);
-  }
-  throw new Error("Unsupported steganography method");
-}
-
 function sleep(ms: number) {
   return new Promise((res) => setTimeout(res, ms));
 }
-
-async function processEncoding() {
-  if (!state.uploadedFile) {
-    state.error = "No file selected";
-    state.screen = "complete";
-    return;
-  }
-  if (!state.method) {
-    state.error = "No steganography method selected";
-    state.screen = "complete";
-    return;
-  }
-
-  state.screen = "processing";
-  state.progress = 0;
-  state.intermediateWritten = false;
-  state.outputPath = makeOutputPath(state.uploadedFile.path);
-
-  try {
-    const fileBuffer = fs.readFileSync(state.uploadedFile.path);
-
-    const { salt, iv, encrypted } = encryptMessage(
-      state.message,
-      state.password || Buffer.alloc(0),
-    );
-    const payload = Buffer.concat([salt, iv, encrypted]);
-
-    for (let p = 0; p <= 100; p++) {
-      state.progress = p;
-
-      if (p === 66 && !state.intermediateWritten) {
-        try {
-          // Attempt an intermediate write using stego method
-          const midBuf = await embedDataToFile(
-            fileBuffer,
-            state.uploadedFile.ext || path.extname(state.uploadedFile.path),
-            state.method,
-            payload,
-          ).catch((e) => {
-            // If embedding fails during intermediate, write generic fallback
-            return embedGeneric(fileBuffer, payload);
-          });
-          fs.writeFileSync(state.outputPath, midBuf);
-          state.intermediateWritten = true;
-        } catch (e) {
-          state.error =
-            "Failed to write intermediate file: " + (e as Error).message;
-        }
-      }
-      await sleep(40);
-
-      if ((global as any).showSection) {
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
-      }
-    }
-
-    // Final embedding
-    try {
-      const finalBuf = await embedDataToFile(
-        fileBuffer,
-        state.uploadedFile.ext || path.extname(state.uploadedFile.path),
-        state.method,
-        payload,
-      );
-      fs.writeFileSync(state.outputPath, finalBuf);
-    } catch (e) {
-      // If embedding failed, fallback to generic append
-      state.error =
-        "Embedding failed, using fallback append: " + (e as Error).message;
-      const final = embedGeneric(fileBuffer, payload);
-      fs.writeFileSync(state.outputPath, final);
-    }
-
-    try {
-      const dest = downloadToDownloads();
-      if (!dest) {
-        // couldn't copy to Downloads; the encoded file remains at state.outputPath
-      }
-    } catch (e) {
-      state.error = "Failed to copy to Downloads: " + (e as Error).message;
-    }
-
-    state.progress = 100;
-    state.screen = "complete";
-    secureWipeBuffer(state.password);
-    state.password = null;
-  } catch (e) {
-    state.error = "Processing failed: " + (e as Error).message;
-    state.screen = "complete";
-  }
+function makeOutputPath(inPath: string) {
+  const dir = path.dirname(inPath);
+  const base = path.basename(inPath);
+  const ext = path.extname(base);
+  const name = ext ? base.slice(0, -ext.length) : base;
+  return path.join(dir, `${name}_encoded${ext || ""}`);
 }
-
 function downloadToDownloads() {
-  if (!state.outputPath || !fs.existsSync(state.outputPath)) return null;
+  if (!state.outputPath || !fssync.existsSync(state.outputPath)) return null;
   try {
     const downloads = path.join(os.homedir(), "Downloads");
-    if (!fs.existsSync(downloads)) fs.mkdirSync(downloads, { recursive: true });
-    const dest = path.join(downloads, path.basename(state.outputPath));
-    fs.copyFileSync(state.outputPath, dest);
+    if (!fssync.existsSync(downloads)) fssync.mkdirSync(downloads, { recursive: true });
+    const dest = path.join(
+      downloads,
+      `${Date.now().toString(16)}_${path.basename(state.outputPath)}`,
+    );
+    fssync.copyFileSync(state.outputPath, dest);
     state.downloadedPath = dest;
     return dest;
   } catch (e) {
@@ -592,93 +98,295 @@ function downloadToDownloads() {
   }
 }
 
+// ===== Header + crypto helpers =====
+function u32be(n: number): Buffer {
+  const b = Buffer.allocUnsafe(4);
+  b.writeUInt32BE(n >>> 0, 0);
+  return b;
+}
+function u32le(n: number): Buffer {
+  const b = Buffer.allocUnsafe(4);
+  b.writeUInt32LE(n >>> 0, 0);
+  return b;
+}
+function buildHeader(params: {
+  encrypted: boolean;
+  randomized: boolean;
+  bitsPerChannel: 1 | 2;
+  channelsMask: number;
+  payloadLen: number;
+  kdf: number;     // KDF id (scrypt)
+  logN: number;    // effective logN used (adaptive)
+  r: number;
+  p: number;
+  salt: Buffer;    // 16
+  iv: Buffer;      // 12
+  tag: Buffer;     // 16
+}): Buffer {
+  const {
+    encrypted,
+    randomized,
+    bitsPerChannel,
+    channelsMask,
+    payloadLen,
+    kdf, logN, r, p,
+    salt,
+    iv,
+    tag,
+  } = params;
+
+  const flags =
+    (encrypted ? FLAG_ENCRYPTED : 0) |
+    (randomized ? FLAG_RANDOMIZED : 0);
+
+  const out = Buffer.alloc(HEADER_SIZE, 0);
+  let o = 0;
+  MAGIC.copy(out, o); o += 4;
+  out[o++] = VERSION;
+  out[o++] = flags & 0xff;
+  out[o++] = bitsPerChannel;
+  out[o++] = channelsMask & 0xff;
+  u32be(payloadLen).copy(out, o); o += 4;
+  out[o++] = kdf & 0xff;
+  out[o++] = logN & 0xff;
+  out[o++] = r & 0xff;
+  out[o++] = p & 0xff;
+  if (salt.length !== 16) throw new Error("salt must be 16 bytes");
+  salt.copy(out, o); o += 16;
+  if (iv.length !== 12) throw new Error("iv must be 12 bytes");
+  iv.copy(out, o); o += 12;
+  if (tag.length !== 16) throw new Error("tag must be 16 bytes");
+  tag.copy(out, o); o += 16;
+  return out;
+}
+
+// Adaptive scrypt: try preferred logN, reduce if memory-limited.
+// Always pass a generous maxmem so Node v22 doesn't reject.
+async function deriveKeyAdaptive(
+  password: string,
+  salt: Buffer,
+  preferredLogN: number,
+  r: number,
+  p: number,
+): Promise<{ key: Buffer; logNUsed: number }> {
+  for (let logN = preferredLogN; logN >= 12; logN--) {
+    const N = 1 << logN;
+    try {
+      const key: any = await new Promise((resolve, reject) => {
+        crypto.scrypt(
+          password,
+          salt,
+          32,
+          {
+            N,
+            r,
+            p,
+            maxmem: 512 * 1024 * 1024, // 512MB to avoid ERR_CRYPTO_INVALID_SCRYPT_PARAMS
+          },
+          (err, derived) => (err ? reject(err) : resolve(derived)),
+        );
+      });
+      return { key: key as Buffer, logNUsed: logN };
+    } catch (e: any) {
+      const msg = (e && e.message) || "";
+      // Try a lower N on memory-limit style errors; otherwise rethrow.
+      if (
+        e?.code === "ERR_CRYPTO_INVALID_SCRYPT_PARAMS" ||
+        /memory limit/i.test(msg)
+      ) {
+        continue; // lower logN and retry
+      }
+      throw e;
+    }
+  }
+  throw new Error("scrypt parameters not supported on this device (too little memory)");
+}
+
+function aesGcmEncrypt(key: Buffer, iv: Buffer, plaintext: Uint8Array): { ciphertext: Buffer, tag: Buffer } {
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const c1 = cipher.update(Buffer.from(plaintext));
+  const c2 = cipher.final();
+  const tag = cipher.getAuthTag();
+  return { ciphertext: Buffer.concat([c1, c2]), tag };
+}
+function textToBytes(t: string): Uint8Array {
+  return new TextEncoder().encode(t);
+}
+
+// ===== PNG LSB randomized =====
+class HmacPRNG {
+  private key: Buffer;
+  private counter = 0;
+  private buf = Buffer.alloc(0);
+  private ptr = 0;
+  constructor(key: Buffer) { this.key = key; }
+  private refill() {
+    const h = crypto.createHmac("sha256", this.key);
+    const blk = Buffer.allocUnsafe(4);
+    blk.writeUInt32BE(this.counter++ >>> 0, 0);
+    h.update(blk);
+    this.buf = h.digest();
+    this.ptr = 0;
+  }
+  nextByte(): number {
+    if (this.ptr >= this.buf.length) this.refill();
+    return this.buf[this.ptr++];
+  }
+  nextUint32(): number {
+    let x = 0;
+    for (let i = 0; i < 4; i++) x = (x << 8) | this.nextByte();
+    return x >>> 0;
+  }
+}
+function enumerateRGBByteIndices(pixels: Uint8Array): number[] {
+  const idxs: number[] = [];
+  for (let i = 0; i < pixels.length; i += 4) {
+    idxs.push(i); idxs.push(i + 1); idxs.push(i + 2);
+  }
+  return idxs;
+}
+function writeHeaderBits(pixels: Uint8Array, header: Uint8Array) {
+  const bits = HEADER_SIZE * 8;
+  const idxs = enumerateRGBByteIndices(pixels);
+  if (idxs.length < bits) throw new Error("Carrier too small for header");
+  for (let i = 0; i < bits; i++) {
+    const byteIndex = Math.floor(i / 8);
+    const bitIndex = 7 - (i % 8);
+    const bit = (header[byteIndex] >> bitIndex) & 1;
+    const p = idxs[i];
+    pixels[p] = (pixels[p] & ~1) | bit;
+  }
+}
+type BitPos = { byteIndex: number; plane: 0 | 1 };
+function buildPayloadPositions(pixels: Uint8Array, bitsPerChannel: 1 | 2): BitPos[] {
+  const allRGB = enumerateRGBByteIndices(pixels);
+  const headerBits = HEADER_SIZE * 8;
+  const usable = allRGB.slice(headerBits);
+  const positions: BitPos[] = [];
+  for (const i of usable) {
+    positions.push({ byteIndex: i, plane: 0 });
+    if (bitsPerChannel === 2) positions.push({ byteIndex: i, plane: 1 });
+  }
+  return positions;
+}
+function shufflePositions(positions: BitPos[], prng: HmacPRNG) {
+  for (let i = positions.length - 1; i > 0; i--) {
+    const j = prng.nextUint32() % (i + 1);
+    const t = positions[i]; positions[i] = positions[j]; positions[j] = t;
+  }
+}
+function embedBits(pixels: Uint8Array, positions: BitPos[], data: Uint8Array) {
+  const totalBits = data.length * 8;
+  if (positions.length < totalBits) {
+    throw new Error(`Carrier capacity too small. Need ${totalBits} bits, have ${positions.length}.`);
+  }
+  let cursor = 0;
+  for (let i = 0; i < data.length; i++) {
+    for (let b = 7; b >= 0; b--) {
+      const bit = (data[i] >> b) & 1;
+      const pos = positions[cursor++];
+      const mask = 1 << pos.plane;
+      const v = pixels[pos.byteIndex];
+      const nv = (v & ~mask) | (bit << pos.plane);
+      pixels[pos.byteIndex] = nv;
+    }
+  }
+}
+function capacityBits(pixels: Uint8Array, bitsPerChannel: 1 | 2): number {
+  const channels = (pixels.length / 4) * 3;
+  const headerBits = HEADER_SIZE * 8;
+  return channels * bitsPerChannel - headerBits;
+}
+
+// ===== JPEG APP15, WebP RIFF, Trailer backends =====
+function isJpeg(buf: Buffer): boolean {
+  return buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xd8;
+}
+function insertJpegAPP15(original: Buffer, blob: Buffer): Buffer {
+  if (!isJpeg(original)) throw new Error("Not a JPEG file");
+  const marker = Buffer.from([0xff, 0xef]); // APP15
+  const maxPayload = 0xffff - 2;
+  if (blob.length > maxPayload) {
+    throw new Error(`Payload too large for one JPEG segment (${blob.length} > ${maxPayload}).`);
+  }
+  const len = Buffer.alloc(2);
+  len.writeUInt16BE(blob.length + 2, 0);
+  let pos = 2;
+  while (pos + 4 <= original.length && original[pos] === 0xff) {
+    const code = original[pos + 1];
+    if (code === 0xda /* SOS */ || code === 0xd9 /* EOI */) break;
+    if (code >= 0xd0 && code <= 0xd7) { pos += 2; continue; } // RSTn
+    const segLen = original.readUInt16BE(pos + 2);
+    if (segLen < 2) break;
+    pos += 2 + segLen;
+  }
+  const before = original.slice(0, pos);
+  const after = original.slice(pos);
+  const segment = Buffer.concat([marker, len, blob]);
+  return Buffer.concat([before, segment, after]);
+}
+function isWebP(buf: Buffer): boolean {
+  return buf.length >= 12 &&
+    buf.slice(0, 4).toString("ascii") === "RIFF" &&
+    buf.slice(8, 12).toString("ascii") === "WEBP";
+}
+function insertWebPChunk(original: Buffer, blob: Buffer): Buffer {
+  if (!isWebP(original)) throw new Error("Not a WebP file");
+  const fourcc = Buffer.from("ECAP", "ascii");
+  const size = u32le(blob.length);
+  const pad = (blob.length % 2) ? Buffer.from([0]) : Buffer.alloc(0);
+  const chunk = Buffer.concat([fourcc, size, blob, pad]);
+  const body = original.slice(12);
+  const newBody = Buffer.concat([body, chunk]);
+  const newSize = newBody.length + 4;
+  return Buffer.concat([
+    Buffer.from("RIFF", "ascii"),
+    u32le(newSize),
+    Buffer.from("WEBP", "ascii"),
+    newBody,
+  ]);
+}
+function appendTrailer(original: Buffer, blob: Buffer): Buffer {
+  return Buffer.concat([original, Buffer.from("ECAPTR", "ascii"), u32be(blob.length), blob]);
+}
+type CarrierKind = "png" | "jpeg" | "webp" | "pdf" | "other";
+function detectCarrier(buf: Buffer, ext: string): CarrierKind {
+  if (buf.length >= 8 && buf.slice(0, 8).toString("ascii") === "\x89PNG\r\n\x1a\n") return "png";
+  if (isJpeg(buf)) return "jpeg";
+  if (isWebP(buf)) return "webp";
+  if (buf.slice(0, 5).toString("ascii") === "%PDF-") return "pdf";
+  const e = (ext || "").toLowerCase();
+  if (e === ".png") return "png";
+  if (e === ".jpg" || e === ".jpeg") return "jpeg";
+  if (e === ".webp") return "webp";
+  if (e === ".pdf") return "pdf";
+  return "other";
+}
+
+// ===== Rendering =====
 function renderUpload() {
   const lines: string[] = [];
   lines.push("");
   lines.push("");
-  lines.push("> Press Enter to Upload");
-  lines.push("");
+  if (!state.pathEntryMode) {
+    lines.push("> Press Enter to Upload");
+  } else {
+    lines.push("Enter full file path and press Enter:");
+    lines.push("");
+    const shown = (state.inputBuffer || "").slice(0, 98);
+    lines.push("┌" + "─".repeat(100) + "┐");
+    lines.push("│ " + shown.padEnd(100) + " │");
+    lines.push("└" + "─".repeat(100) + "┘");
+    lines.push("");
+    lines.push("ESC to cancel");
+  }
   return lines.join("\n");
 }
-
-function renderMethodSelection() {
-  const marker = "[[LEFT_ALIGN]]\n";
-  const lines: string[] = [];
-  lines.push("");
-  lines.push("");
-  const hint = chalk.dim(" » Space to select. Enter to submit.");
-  lines.push(
-    "                        Which method would you like to use? " + hint,
-  );
-  lines.push("");
-  const sel = state.method || "lsb";
-  const lsbMark = sel === "lsb" ? chalk.hex("#f97316")("(*)") : "( )";
-  const dctMark = sel === "dct" ? chalk.hex("#f97316")("(*)") : "( )";
-  lines.push("                        " + lsbMark + " LSB Insertion");
-  lines.push(
-    "                        " + dctMark + " DCT Coefficient Manipulation",
-  );
-  lines.push("");
-  return marker + lines.join("\n");
-}
-
 function renderMessage() {
   const vpWidth = Math.max(40, term.width || 80);
   const boxWidth = Math.min(96, Math.max(40, Math.floor(vpWidth * 0.6)));
-  const boxHeight = Math.min(
-    16,
-    Math.max(6, Math.floor((term.height || 24 - 8) / 2)),
-  );
-
+  const boxHeight = Math.min(16, Math.max(6, Math.floor(((term.height || 24) - 8) / 2)));
   const currentBytes = Buffer.from(state.inputBuffer || "", "utf8").length;
-
-  let capacityBytes: number | null = null;
-  if (state.uploadedFile && state.method) {
-    try {
-      const fileBuffer = fs.readFileSync(state.uploadedFile.path);
-      const ext = (state.uploadedFile.ext || "").toLowerCase();
-      if (state.method === "lsb") {
-        try {
-          const PNG = require("pngjs").PNG as any;
-          const png = PNG.sync.read(fileBuffer);
-          const capacityBits = png.width * png.height * 3;
-          capacityBytes = Math.max(0, Math.floor((capacityBits - 32) / 8));
-        } catch {
-          try {
-            const jpeg = require("jpeg-js") as any;
-            const raw = jpeg.decode(fileBuffer, { useTArray: true }) as {
-              width: number;
-              height: number;
-            };
-            const capacityBits = raw.width * raw.height * 3;
-            capacityBytes = Math.max(0, Math.floor((capacityBits - 32) / 8));
-          } catch {
-            // fallback to conservative estimate based on file size
-            capacityBytes = Math.max(0, Math.floor(fileBuffer.length / 16));
-          }
-        }
-      } else if (state.method === "dct") {
-        // DCT embedding (JPEG) - 1 bit per 8x8 block (approx)
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-var-requires
-          const jpeg = require("jpeg-js") as any;
-          const raw = jpeg.decode(fileBuffer, { useTArray: true }) as {
-            width: number;
-            height: number;
-          };
-          const blocksX = Math.floor(raw.width / 8);
-          const blocksY = Math.floor(raw.height / 8);
-          const capacityBits = blocksX * blocksY; // 1 bit per block
-          capacityBytes = Math.max(0, Math.floor(capacityBits / 8));
-        } catch {
-          // unable to decode; fallback conservative
-          capacityBytes = Math.max(0, Math.floor(fileBuffer.length / 64));
-        }
-      }
-    } catch {
-      capacityBytes = null;
-    }
-  }
 
   const raw = state.inputBuffer || "";
   const rows = raw.split("\n");
@@ -688,20 +396,11 @@ function renderMessage() {
   const lines: string[] = [];
   lines.push("");
   lines.push("");
-  // Show live byte count and capacity (if known)
-  if (capacityBytes === null) {
-    lines.push(
-      "Enter secret message " +
-        chalk.hex("#f97316")(`(${currentBytes} / ? b):`),
-    );
-  } else {
-    lines.push(
-      "Enter secret message " +
-        chalk.hex("#f97316")(`(${currentBytes} / ${capacityBytes} b):`),
-    );
-  }
+  lines.push(
+    "Enter secret message " +
+      chalk.hex("#f97316")(`(${currentBytes} b):`)
+  );
   lines.push("");
-
   const top = "┌" + "─".repeat(boxWidth + 2) + "┐";
   const bottom = "└" + "─".repeat(boxWidth + 2) + "┘";
   lines.push(top);
@@ -715,16 +414,14 @@ function renderMessage() {
   lines.push("Press Ctrl+S to finish — ENTER inserts newline");
   return lines.join("\n");
 }
-
 function renderPassword() {
   const vpWidth = Math.max(40, term.width || 80);
   const boxWidth = Math.min(72, Math.max(24, Math.floor(vpWidth * 0.35)));
   const masked = "*".repeat(state.inputBuffer.length || 0);
-
   const lines: string[] = [];
   lines.push("");
   lines.push("");
-  lines.push("Enter password :");
+  lines.push("Enter password (will not be stored):");
   lines.push("");
   lines.push("┌" + "─".repeat(boxWidth + 2) + "┐");
   lines.push("│ " + masked.slice(0, boxWidth).padEnd(boxWidth) + " │");
@@ -733,15 +430,10 @@ function renderPassword() {
   lines.push("Press ENTER when done");
   return lines.join("\n");
 }
-
 function renderProgressBlock() {
   const labels = ["Uploading", "Encrypting", "Finalizing"];
-  const barWidth = Math.min(
-    44,
-    Math.max(24, Math.floor((term.width || 80) * 0.28)),
-  );
+  const barWidth = Math.min(44, Math.max(24, Math.floor((term.width || 80) * 0.28)));
   const rows: string[] = [];
-
   const globalPct = Math.max(0, Math.min(100, Math.round(state.progress || 0)));
 
   for (let i = 0; i < labels.length; i++) {
@@ -750,31 +442,18 @@ function renderProgressBlock() {
     let localPct = 0;
     if (globalPct <= segStart) localPct = 0;
     else if (globalPct >= segEnd) localPct = 100;
-    else
-      localPct = Math.round(
-        ((globalPct - segStart) / (segEnd - segStart)) * 100,
-      );
+    else localPct = Math.round(((globalPct - segStart) / (segEnd - segStart)) * 100);
 
     const filled = Math.round((localPct / 100) * barWidth);
-    const equals = "=".repeat(filled);
-    const coloredEquals = chalk.hex("#FFA500")(equals);
-    const bar =
-      "[" + coloredEquals + " ".repeat(Math.max(0, barWidth - filled)) + "]";
-    rows.push(
-      labels[i].padEnd(11) +
-        " : " +
-        bar +
-        " " +
-        String(localPct).padStart(3) +
-        "%",
-    );
+    const eq = "=".repeat(filled);
+    const coloredEq = chalk.hex("#FFA500")(eq);
+    const bar = "[" + coloredEq + " ".repeat(Math.max(0, barWidth - filled)) + "]";
+    rows.push(labels[i].padEnd(11) + " : " + bar + " " + String(localPct).padStart(3) + "%");
   }
-
   rows.push("");
   rows.push("Find encoded file in your Downloads folder");
   return rows.join("\n");
 }
-
 function renderProcessing() {
   const lines: string[] = [];
   lines.push("");
@@ -786,7 +465,6 @@ function renderProcessing() {
   lines.push(" ");
   return lines.join("\n");
 }
-
 function renderComplete() {
   const lines: string[] = [];
   lines.push("");
@@ -800,178 +478,258 @@ function renderComplete() {
   if (state.error) {
     lines.push("");
     lines.push(chalk.red("Note: " + state.error));
-    lines.push("");
-    lines.push(
-      chalk.yellow(
-        "If embedding failed due to missing libraries, install 'pngjs' and/or 'jpeg-js' and try again.",
-      ),
-    );
   }
   lines.push("");
   lines.push("Press any key to start over");
   return lines.join("\n");
 }
 
+// ===== Core processing =====
+async function embedAuto(fileBuffer: Buffer, ext: string, header: Buffer, ciphertext: Buffer, key: Buffer): Promise<Buffer> {
+  const blob = Buffer.concat([header, ciphertext]);
+  const kind = detectCarrier(fileBuffer, ext);
+
+  switch (kind) {
+    case "png": {
+      const png = PNG.sync.read(fileBuffer) as any;
+      const data: Uint8Array = png.data;
+      const capBits = capacityBits(data, 1);
+      if (capBits < ciphertext.length * 8) {
+        throw new Error(`Carrier too small. Capacity: ${Math.floor(capBits / 8)} bytes; Need: ${ciphertext.length} bytes`);
+      }
+      // header then randomized payload
+      writeHeaderBits(data, header);
+      const positions = buildPayloadPositions(data, 1);
+      const prngKey = crypto.createHmac("sha256", key).update("ECAP-PERMUTE").digest();
+      const prng = new HmacPRNG(prngKey);
+      shufflePositions(positions, prng);
+      embedBits(data, positions, ciphertext);
+      png.data = Buffer.from(data);
+      const outBuf = PNG.sync.write(png as any);
+      return Buffer.from(outBuf);
+    }
+
+    case "jpeg": {
+      if (blob.length > 0xffff - 2) {
+        throw new Error(`Message too large for a single JPEG chunk (~64KB max). Use a PNG carrier for larger data.`);
+      }
+      return insertJpegAPP15(fileBuffer, blob);
+    }
+
+    case "webp": {
+      return insertWebPChunk(fileBuffer, blob);
+    }
+
+    case "pdf":
+    case "other": {
+      return appendTrailer(fileBuffer, blob);
+    }
+  }
+}
+
+// Main processing loop with animation
+async function processEncoding() {
+  if (!state.uploadedFile) {
+    state.error = "No file selected";
+    state.screen = "complete";
+    return;
+  }
+  if (!state.message) {
+    state.error = "Message is empty";
+    state.screen = "complete";
+    return;
+  }
+  state.screen = "processing";
+  state.progress = 0;
+  state.intermediateWritten = false;
+  state.outputPath = makeOutputPath(state.uploadedFile.path);
+
+  // Build crypto artifacts (adaptive scrypt)
+  const plaintext = textToBytes(state.message);
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+
+  let key: Buffer;
+  let logNUsed = SCRYPT_LOGN_PREFERRED;
+  try {
+    const res = await deriveKeyAdaptive(
+      (state.password || Buffer.alloc(0)).toString("utf8"),
+      salt,
+      SCRYPT_LOGN_PREFERRED,
+      SCRYPT_R,
+      SCRYPT_P,
+    );
+    key = res.key;
+    logNUsed = res.logNUsed;
+  } catch (e: any) {
+    state.error = "Key derivation failed: " + (e.message || String(e));
+    state.screen = "complete";
+    return;
+  }
+
+  const { ciphertext, tag } = aesGcmEncrypt(key, iv, plaintext);
+  const header = buildHeader({
+    encrypted: true,
+    randomized: true,
+    bitsPerChannel: 1,
+    channelsMask: CHANNELS_MASK_RGB,
+    payloadLen: plaintext.length,
+    kdf: KDF_SCRYPT,
+    logN: logNUsed,
+    r: SCRYPT_R,
+    p: SCRYPT_P,
+    salt, iv, tag,
+  });
+
+  try {
+    const fileBuffer = await fs.readFile(state.uploadedFile.path);
+    for (let p = 0; p <= 100; p++) {
+      state.progress = p;
+
+      // At 66%, attempt an intermediate write so the user sees work happening
+      if (p === 66 && !state.intermediateWritten) {
+        try {
+          const midBuf = await embedAuto(
+            fileBuffer,
+            state.uploadedFile.ext || path.extname(state.uploadedFile.path),
+            header,
+            ciphertext,
+            key,
+          );
+          await fs.writeFile(state.outputPath, midBuf);
+          state.intermediateWritten = true;
+        } catch (e) {
+          // Don't fail the whole run here; continue to final write at 100%
+          state.error = "Intermediate write failed: " + (e as Error).message;
+        }
+      }
+
+      await sleep(35);
+      if ((global as any).showSection) {
+        try { (global as any).showSection("Encode"); } catch {}
+      }
+    }
+
+    // Final embedding
+    try {
+      const finalBuf = await embedAuto(
+        fileBuffer,
+        state.uploadedFile.ext || path.extname(state.uploadedFile.path),
+        header,
+        ciphertext,
+        key,
+      );
+      await fs.writeFile(state.outputPath, finalBuf);
+    } catch (e) {
+      state.error = "Embedding failed: " + (e as Error).message;
+      // As a last resort, append a trailer blob so the user still gets an output
+      const fallback = appendTrailer(fileBuffer, Buffer.concat([header, ciphertext]));
+      await fs.writeFile(state.outputPath, fallback);
+    }
+
+    downloadToDownloads();
+    state.progress = 100;
+    state.screen = "complete";
+    secureWipeBuffer(state.password);
+    state.password = null;
+  } catch (e) {
+    state.error = "Processing failed: " + (e as Error).message;
+    state.screen = "complete";
+  }
+}
+
+// ===== Input handling and rendering export =====
 export function handleEncodeInput(key: string, data?: any): boolean {
-  // Robust Enter detection: some terminals/clients send different key names or embed the enter
-  // as a codepoint or as '\r' / '\n'. Accept a wider set of possibilities so ENTER works
-  // reliably on the method selection screen and elsewhere.
   const isEnter =
     key === "ENTER" ||
     key === "RETURN" ||
     key === "KP_ENTER" ||
-    key === "CR" ||
-    key === "LF" ||
-    key === "\r" ||
-    key === "\n" ||
-    key === "ENTER_KEY" ||
-    (data &&
-      (data.key === "Enter" ||
-        data.key === "RETURN" ||
-        data.key === "EnterKey" ||
-        data.codepoint === 13 ||
-        data.codepoint === 10));
+    (data && (data.codepoint === 13 || data.codepoint === 10));
 
-  if (key === "ESCAPE") {
+  // Global escape resets to upload
+  if (key === "ESCAPE" && state.screen !== "processing") {
     secureWipeBuffer(state.password);
     state = {
       screen: "upload",
-      method: null,
       uploadedFile: null,
+      inputBuffer: "",
       message: "",
       password: null,
-      inputBuffer: "",
       outputPath: "",
       progress: 0,
       intermediateWritten: false,
+      pathEntryMode: false,
     };
-    if ((global as any).showSection)
-      try {
-        (global as any).showSection("Encode");
-      } catch {}
+    if ((global as any).showSection) {
+      try { (global as any).showSection("Encode"); } catch {}
+    }
     return true;
   }
 
-  if (state.screen === "upload" && isEnter) {
-    openFilePicker().then((filePath) => {
-      if (filePath) {
-        try {
-          const stats = fs.statSync(filePath);
-          state.uploadedFile = {
-            path: filePath,
-            name: path.basename(filePath),
-            size: stats.size,
-            ext: path.extname(filePath),
-          };
-          state.screen = "method";
+  if (state.screen === "upload") {
+    if (!state.pathEntryMode && isEnter) {
+      pickCarrierFile().then((picked) => {
+        if (picked === "__PROMPT__") {
+          state.pathEntryMode = true;
           state.inputBuffer = "";
-          state.progress = 0;
-          secureWipeBuffer(state.password);
-          state.password = null;
-          if ((global as any).showSection)
-            try {
-              (global as any).showSection("Encode");
-            } catch {}
-        } catch {
-          // ignore
+          if ((global as any).showSection) try { (global as any).showSection("Encode"); } catch {}
+          return;
         }
-      } else {
-        // user cancelled
-      }
-    });
-    return true;
-  }
-
-  if (state.screen === "method") {
-    // Normalize key and accept many representations so ENTER reliably confirms selection.
-    // Some terminals provide different properties (data.key, data.code, data.keyCode, charCode, codepoint).
-    const normalizedKey =
-      typeof key === "string" && key ? key.toString().toUpperCase() : "";
-    const dataKey =
-      data && (data.key || data.name || data.code)
-        ? String(data.key || data.name || data.code)
-        : null;
-
-    // Broad enter detection: normalize multiple possible signals for Enter/Return
-    const isEnterLocal =
-      // explicit normalized key names
-      normalizedKey === "ENTER" ||
-      normalizedKey === "RETURN" ||
-      normalizedKey === "KP_ENTER" ||
-      normalizedKey === "ENTER_KEY" ||
-      normalizedKey === "RETURN_KEY" ||
-      // control characters
-      normalizedKey === "CR" ||
-      normalizedKey === "LF" ||
-      normalizedKey === "\r" ||
-      normalizedKey === "\n" ||
-      normalizedKey === "\u000d" ||
-      normalizedKey === "\u000a" ||
-      // data.key variants (some terminals set data.key)
-      (data &&
-        (data.key === "Enter" ||
-          data.key === "RETURN" ||
-          data.key === "EnterKey" ||
-          data.key === "Return")) ||
-      // data.code variants (e.g., 'Enter')
-      (data && (data.code === "Enter" || data.code === "NumpadEnter")) ||
-      // numeric code variants
-      (data &&
-        (data.keyCode === 13 ||
-          data.which === 13 ||
-          data.charCode === 13 ||
-          data.codepoint === 13 ||
-          data.codepoint === 10)) ||
-      // fallback: single-character key whose charCode is CR or LF
-      (typeof key === "string" &&
-        key.length === 1 &&
-        (key.charCodeAt(0) === 13 || key.charCodeAt(0) === 10));
-
-    if (normalizedKey === "1") {
-      // set selection to LSB (do not auto-confirm)
-      state.method = "lsb";
-      if ((global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
-      return true;
-    } else if (normalizedKey === "2") {
-      // set selection to DCT (do not auto-confirm)
-      state.method = "dct";
-      if ((global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
-      return true;
-    } else if (normalizedKey === " " || normalizedKey === "SPACE") {
-      // Toggle selection between LSB and DCT without advancing to message screen
-      if (state.method === "lsb") state.method = "dct";
-      else state.method = "lsb";
-      if ((global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
-      return true;
-    } else if (isEnterLocal) {
-      // Confirm selection (default to LSB if none chosen)
-      if (!state.method) state.method = "lsb";
-      state.screen = "message";
-      state.inputBuffer = "";
-      state.progress = 0;
-      if ((global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
-      return true;
-    } else if (normalizedKey === "ESCAPE") {
-      state.method = null;
-      state.screen = "upload";
-      if ((global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
+        if (picked) {
+          try {
+            const stats = fssync.statSync(picked);
+            state.uploadedFile = {
+              path: picked,
+              name: path.basename(picked),
+              size: stats.size,
+              ext: path.extname(picked),
+            };
+            state.screen = "message";
+            state.inputBuffer = "";
+            state.progress = 0;
+            secureWipeBuffer(state.password);
+            state.password = null;
+            if ((global as any).showSection) try { (global as any).showSection("Encode"); } catch {}
+          } catch {}
+        }
+      });
       return true;
     }
+
+    if (state.pathEntryMode) {
+      if (isEnter) {
+        const pth = (state.inputBuffer || "").trim();
+        if (pth && fssync.existsSync(pth)) {
+          try {
+            const stats = fssync.statSync(pth);
+            state.uploadedFile = {
+              path: pth,
+              name: path.basename(pth),
+              size: stats.size,
+              ext: path.extname(pth),
+            };
+            state.screen = "message";
+            state.inputBuffer = "";
+            state.pathEntryMode = false;
+            if ((global as any).showSection) try { (global as any).showSection("Encode"); } catch {}
+          } catch {}
+          return true;
+        } else {
+          // keep prompting
+          return true;
+        }
+      }
+      if (key === "BACKSPACE" || key === "DELETE") {
+        state.inputBuffer = state.inputBuffer.slice(0, -1);
+        return true;
+      }
+      if (key && key.length === 1) {
+        state.inputBuffer += key;
+        return true;
+      }
+      return false;
+    }
+
     return false;
   }
 
@@ -982,28 +740,19 @@ export function handleEncodeInput(key: string, data?: any): boolean {
       state.inputBuffer = "";
       state.progress = 33;
       state.screen = "password";
-      if ((global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
+      if ((global as any).showSection) try { (global as any).showSection("Encode"); } catch {}
       return true;
     }
-
     if (isEnter) {
-      state.inputBuffer = state.inputBuffer + "\n";
-      if ((global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
+      state.inputBuffer += "\n";
+      if ((global as any).showSection) try { (global as any).showSection("Encode"); } catch {}
       return true;
     }
-
     if (key === "BACKSPACE" || key === "DELETE") {
       state.inputBuffer = state.inputBuffer.slice(0, -1);
       return true;
     }
-
-    if (key.length === 1) {
+    if (key && key.length === 1) {
       state.inputBuffer += key;
       return true;
     }
@@ -1019,23 +768,17 @@ export function handleEncodeInput(key: string, data?: any): boolean {
       state.screen = "processing";
       setTimeout(() => {
         processEncoding().then(() => {
-          if ((global as any).showSection)
-            try {
-              (global as any).showSection("Encode");
-            } catch {}
+          if ((global as any).showSection) try { (global as any).showSection("Encode"); } catch {}
         });
       }, 80);
-      if ((global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
+      if ((global as any).showSection) try { (global as any).showSection("Encode"); } catch {}
       return true;
     }
     if (key === "BACKSPACE" || key === "DELETE") {
       state.inputBuffer = state.inputBuffer.slice(0, -1);
       return true;
     }
-    if (key.length === 1 && state.inputBuffer.length < 256) {
+    if (key && key.length === 1 && state.inputBuffer.length < 256) {
       state.inputBuffer += key;
       return true;
     }
@@ -1043,46 +786,24 @@ export function handleEncodeInput(key: string, data?: any): boolean {
   }
 
   if (state.screen === "processing") {
-    if (
-      (key === "d" || key === "D") &&
-      (state.intermediateWritten || state.progress >= 100)
-    ) {
-      const dest = downloadToDownloads();
-      if (dest && (global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
-      return true;
-    }
-    return true; // ignore other keys while processing
+    return true; // ignore keys during processing
   }
 
   if (state.screen === "complete") {
-    if (key === "d" || key === "D") {
-      const dest = downloadToDownloads();
-      if (dest && (global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
-      return true;
-    }
     if (key && key.length > 0) {
       secureWipeBuffer(state.password);
       state = {
         screen: "upload",
-        method: null,
         uploadedFile: null,
+        inputBuffer: "",
         message: "",
         password: null,
-        inputBuffer: "",
         outputPath: "",
         progress: 0,
         intermediateWritten: false,
+        pathEntryMode: false,
       };
-      if ((global as any).showSection)
-        try {
-          (global as any).showSection("Encode");
-        } catch {}
+      if ((global as any).showSection) try { (global as any).showSection("Encode"); } catch {}
       return true;
     }
     return true;
@@ -1093,20 +814,12 @@ export function handleEncodeInput(key: string, data?: any): boolean {
 
 export default function Encode(): string {
   switch (state.screen) {
-    case "upload":
-      return renderUpload();
-    case "method":
-      return renderMethodSelection();
-    case "message":
-      return renderMessage();
-    case "password":
-      return renderPassword();
-    case "processing":
-      return renderProcessing();
-    case "complete":
-      return renderComplete();
-    default:
-      return renderUpload();
+    case "upload": return renderUpload();
+    case "message": return renderMessage();
+    case "password": return renderPassword();
+    case "processing": return renderProcessing();
+    case "complete": return renderComplete();
+    default: return renderUpload();
   }
 }
 
